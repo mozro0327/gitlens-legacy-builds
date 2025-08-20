@@ -7,8 +7,13 @@ on:
         description: "Override upstream tag (e.g. v17.3.4). Leave empty to use upstream latest"
         required: false
         default: ""
+      force:
+        description: "Force republish even if same tag already exists"
+        required: false
+        type: boolean
+        default: false
   schedule:
-    - cron: "0 0 * * *" # 每天 UTC+8 8:00am 触发
+    - cron: "0 0 * * *" # 每天 UTC 00:00（北京 08:00）
 
 permissions:
   contents: write
@@ -34,7 +39,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 1) 上游最新 tag（或人工指定）
+
+          # 1) upstream latest tag (or manually specified)
           if [[ -n "${{ github.event.inputs.tag }}" ]]; then
             UPSTREAM_TAG="${{ github.event.inputs.tag }}"
           else
@@ -44,25 +50,26 @@ jobs:
             echo "Failed to resolve upstream tag"; exit 1
           fi
 
-          # 2) 本仓库最新 release 的 tag（可能不存在）
+          # 2) local latest release tag (may not exist)
           set +e
           LOCAL_TAG="$(gh release view --json tagName -q .tagName 2>/dev/null)"
           set -e
           echo "Upstream latest tag: $UPSTREAM_TAG"
           echo "Local   latest tag: ${LOCAL_TAG:-<none>}"
 
-          # 3) 是否需要发布：本地没有 release，或 tag 不同
-          if [[ -z "${LOCAL_TAG:-}" || "$LOCAL_TAG" != "$UPSTREAM_TAG" ]]; then
+          # 3) whether to publish: local release not exists, or tag different, or manually force
+          FORCE="${{ github.event.inputs.force }}"
+          if [[ -z "${LOCAL_TAG:-}" || "$LOCAL_TAG" != "$UPSTREAM_TAG" || "$FORCE" == "true" ]]; then
             echo "changed=true"  >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
           echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Skip if no new version
+      - name: Skip if no new version (and not forced)
         if: steps.resolve.outputs.changed == 'false'
         run: |
-          echo "No new upstream release (same tag as local). Skipping."
+          echo "No new upstream release (same tag as local) and force=false. Skipping gracefully."
           exit 0
 
       - name: Download upstream VSIX
@@ -88,7 +95,7 @@ jobs:
           WORKDIR="$(mktemp -d)"
           unzip -q "$VSIX_FILE" -d "$WORKDIR"
 
-          # package.json 可能在根或 extension/ 目录
+          # package.json may be in root or extension/ directory
           if [[ -f "$WORKDIR/extension/package.json" ]]; then
             PKG_PATH="$WORKDIR/extension/package.json"
           elif [[ -f "$WORKDIR/package.json" ]]; then
@@ -114,15 +121,35 @@ jobs:
           echo "OUT_PATH=$OUT_PATH" >> "$GITHUB_OUTPUT"
           echo "Result file:"; ls -lah "$OUT_PATH"
 
-      - name: Create release and upload asset
+      - name: Create or update release (graceful when exists)
         shell: bash
         run: |
           set -euo pipefail
           TAG="${{ steps.resolve.outputs.upstream_tag }}"
           OUT_PATH="${{ steps.patch.outputs.OUT_PATH }}"
           OUT_NAME="${{ steps.patch.outputs.OUT_NAME }}"
+          FORCE="${{ github.event.inputs.force }}"
 
-          # 创建本仓库同名新 release（本步只在 changed=true 时执行）
-          gh release create "$TAG" "$OUT_PATH" \
-            --title "Patched GitLens $TAG (engines >= 1.81.0)" \
-            --notes "Auto-patched from upstream $UPSTREAM_REPO@$TAG. engines.vscode set to >=1.81.0."
+          echo "Will publish tag: $TAG"
+          test -f "$OUT_PATH" || (echo "File not found: $OUT_PATH" && exit 1)
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [[ "$FORCE" == "true" ]]; then
+              echo "Release $TAG exists. FORCE=true → replace asset."
+              if gh release view "$TAG" --json assets -q '.assets[].name' | grep -Fx "$OUT_NAME" >/dev/null 2>&1; then
+                gh release delete-asset "$TAG" "$OUT_NAME" -y || true
+              fi
+              gh release upload "$TAG" "$OUT_PATH" --clobber
+            else
+              echo "Release $TAG already exists. FORCE=false → skip gracefully."
+              exit 0
+            fi
+          else
+            gh release create "$TAG" "$OUT_PATH" \
+              --title "Patched GitLens $TAG (engines >= 1.81.0)" \
+              --notes "Auto-patched from upstream $UPSTREAM_REPO@$TAG. engines.vscode set to >=1.81.0."
+          fi
+
+      - name: Summary
+        run: |
+          echo "Done. Tag: ${{ steps.resolve.outputs.upstream_tag }}"
