@@ -1,17 +1,17 @@
-name: Patch GitLens VSIX (engines >= 1.81.0)
+name: Patch GitLens VSIX (engines >= 1.81.0, only on new upstream)
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Upstream release tag (e.g. v17.3.4). Leave empty to use latest"
+        description: "Override upstream tag (e.g. v17.3.4). Leave empty to use upstream latest"
         required: false
         default: ""
   schedule:
-    - cron: "15 1 * * *"  # 01:15 UTC，每天跑一次
+    - cron: "0 0 * * *" # 每天 UTC+8 8:00am 触发
 
 permissions:
-  contents: write  # 允许创建/更新 release、上传资产
+  contents: write
 
 env:
   UPSTREAM_REPO: eamodio/vscode-gitlens
@@ -24,43 +24,58 @@ jobs:
       - name: Checkout (current repo)
         uses: actions/checkout@v4
 
-      - name: Show workspace
-        run: |
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          ls -lah
-
-      - name: Resolve upstream tag
-        id: resolve
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
-            TAG="${{ github.event.inputs.tag }}"
-          else
-            TAG="$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName)"
-          fi
-          if [[ -z "$TAG" ]]; then
-            echo "Failed to resolve tag"; exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved upstream tag: $TAG"
-
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq zip unzip
+
+      - name: Resolve upstream & local tags
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 1) 上游最新 tag（或人工指定）
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            UPSTREAM_TAG="${{ github.event.inputs.tag }}"
+          else
+            UPSTREAM_TAG="$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName)"
+          fi
+          if [[ -z "$UPSTREAM_TAG" ]]; then
+            echo "Failed to resolve upstream tag"; exit 1
+          fi
+
+          # 2) 本仓库最新 release 的 tag（可能不存在）
+          set +e
+          LOCAL_TAG="$(gh release view --json tagName -q .tagName 2>/dev/null)"
+          set -e
+          echo "Upstream latest tag: $UPSTREAM_TAG"
+          echo "Local   latest tag: ${LOCAL_TAG:-<none>}"
+
+          # 3) 是否需要发布：本地没有 release，或 tag 不同
+          if [[ -z "${LOCAL_TAG:-}" || "$LOCAL_TAG" != "$UPSTREAM_TAG" ]]; then
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if no new version
+        if: steps.resolve.outputs.changed == 'false'
+        run: |
+          echo "No new upstream release (same tag as local). Skipping."
+          exit 0
 
       - name: Download upstream VSIX
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/vsix_src"
-          gh release download "${{ steps.resolve.outputs.tag }}" -R "$UPSTREAM_REPO" -p "*.vsix" -D "$GITHUB_WORKSPACE/vsix_src"
-          echo "Downloaded:"
+          gh release download "${{ steps.resolve.outputs.upstream_tag }}" -R "$UPSTREAM_REPO" -p "*.vsix" -D "$GITHUB_WORKSPACE/vsix_src"
+          echo "Downloaded VSIX assets:"
           ls -lah "$GITHUB_WORKSPACE/vsix_src"
           VSIX_FILE="$(ls -1 "$GITHUB_WORKSPACE/vsix_src"/*.vsix | head -n1)"
           if [[ -z "${VSIX_FILE:-}" ]]; then
-            echo "No VSIX found in upstream release"; exit 1
+            echo "No VSIX asset found in upstream release"; exit 1
           fi
           echo "VSIX_FILE=$VSIX_FILE" >> "$GITHUB_ENV"
 
@@ -73,7 +88,7 @@ jobs:
           WORKDIR="$(mktemp -d)"
           unzip -q "$VSIX_FILE" -d "$WORKDIR"
 
-          PKG_PATH=""
+          # package.json 可能在根或 extension/ 目录
           if [[ -f "$WORKDIR/extension/package.json" ]]; then
             PKG_PATH="$WORKDIR/extension/package.json"
           elif [[ -f "$WORKDIR/package.json" ]]; then
@@ -91,41 +106,23 @@ jobs:
           echo "Patched engines.vscode:"
           jq -r '.engines.vscode' "$PKG_PATH"
 
-          OUT_NAME="gitlens-${{ steps.resolve.outputs.tag }}-patched_1.81.vsix"
+          OUT_NAME="gitlens-${{ steps.resolve.outputs.upstream_tag }}-patched_1.81.vsix"
           OUT_PATH="$GITHUB_WORKSPACE/$OUT_NAME"
           (cd "$WORKDIR" && zip -qr "$OUT_PATH" .)
 
-          echo "OUT_NAME=$OUT_NAME"   >> "$GITHUB_OUTPUT"
-          echo "OUT_PATH=$OUT_PATH"   >> "$GITHUB_OUTPUT"
+          echo "OUT_NAME=$OUT_NAME" >> "$GITHUB_OUTPUT"
+          echo "OUT_PATH=$OUT_PATH" >> "$GITHUB_OUTPUT"
+          echo "Result file:"; ls -lah "$OUT_PATH"
 
-          echo "Result file:"
-          ls -lah "$OUT_PATH"
-
-      - name: Create or update release in current repo
+      - name: Create release and upload asset
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${{ steps.resolve.outputs.tag }}"
+          TAG="${{ steps.resolve.outputs.upstream_tag }}"
           OUT_PATH="${{ steps.patch.outputs.OUT_PATH }}"
           OUT_NAME="${{ steps.patch.outputs.OUT_NAME }}"
 
-          echo "Uploading $OUT_PATH to release $TAG"
-          test -f "$OUT_PATH" || (echo "File not found: $OUT_PATH" && exit 1)
-
-          # 若 release 不存在则创建并附带资产
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" "$OUT_PATH" \
-              --title "Patched GitLens $TAG (engines >= 1.81.0)" \
-              --notes "Auto-patched from upstream $UPSTREAM_REPO@$TAG. engines.vscode set to >=1.81.0."
-          else
-            # 存在则先删同名资产（若存在），再上传
-            if gh release view "$TAG" --json assets -q '.assets[].name' | grep -Fx "$OUT_NAME" >/dev/null 2>&1; then
-              echo "Replacing existing asset $OUT_NAME ..."
-              gh release delete-asset "$TAG" "$OUT_NAME" -y || true
-            fi
-            gh release upload "$TAG" "$OUT_PATH" --clobber
-          fi
-
-      - name: Summary
-        run: |
-          echo "Done. Attached ${{ steps.patch.outputs.OUT_NAME }} to release ${{ steps.resolve.outputs.tag }}"
+          # 创建本仓库同名新 release（本步只在 changed=true 时执行）
+          gh release create "$TAG" "$OUT_PATH" \
+            --title "Patched GitLens $TAG (engines >= 1.81.0)" \
+            --notes "Auto-patched from upstream $UPSTREAM_REPO@$TAG. engines.vscode set to >=1.81.0."
