@@ -8,13 +8,13 @@ on:
         required: false
         default: ""
   schedule:
-    - cron: "15 1 * * *" # 每天 10:15 JST 触发（01:15 UTC）
+    - cron: "15 1 * * *"  # 01:15 UTC，每天跑一次
 
 permissions:
-  contents: write  # 需要创建/更新 release、上传资产
+  contents: write  # 允许创建/更新 release、上传资产
 
 env:
-  UPSTREAM_REPO: "eamodio/vscode-gitlens"
+  UPSTREAM_REPO: eamodio/vscode-gitlens
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -24,42 +24,59 @@ jobs:
       - name: Checkout (current repo)
         uses: actions/checkout@v4
 
-      - name: Determine target tag
-        id: tag
+      - name: Show workspace
         run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          ls -lah
+
+      - name: Resolve upstream tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
             TAG="${{ github.event.inputs.tag }}"
           else
-            TAG=$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName)
+            TAG="$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName)"
           fi
-          if [ -z "$TAG" ]; then
+          if [[ -z "$TAG" ]]; then
             echo "Failed to resolve tag"; exit 1
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "Target upstream tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved upstream tag: $TAG"
 
-      - name: Download upstream VSIX asset
+      - name: Install tools
         run: |
-          mkdir -p vsix_src
-          gh release download "${{ steps.tag.outputs.tag }}" -R "$UPSTREAM_REPO" -p "*.vsix" -D vsix_src
-          echo "Downloaded files:"; ls -l vsix_src
-          VSIX_FILE=$(ls -1 vsix_src/*.vsix | head -n1)
-          if [ -z "$VSIX_FILE" ]; then
-            echo "No VSIX asset found in upstream release"; exit 1
+          sudo apt-get update
+          sudo apt-get install -y jq zip unzip
+
+      - name: Download upstream VSIX
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/vsix_src"
+          gh release download "${{ steps.resolve.outputs.tag }}" -R "$UPSTREAM_REPO" -p "*.vsix" -D "$GITHUB_WORKSPACE/vsix_src"
+          echo "Downloaded:"
+          ls -lah "$GITHUB_WORKSPACE/vsix_src"
+          VSIX_FILE="$(ls -1 "$GITHUB_WORKSPACE/vsix_src"/*.vsix | head -n1)"
+          if [[ -z "${VSIX_FILE:-}" ]]; then
+            echo "No VSIX found in upstream release"; exit 1
           fi
-          echo "VSIX_FILE=$VSIX_FILE" >> $GITHUB_ENV
+          echo "VSIX_FILE=$VSIX_FILE" >> "$GITHUB_ENV"
 
       - name: Patch engines.vscode to >=1.81.0
+        id: patch
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          echo "Using VSIX_FILE=$VSIX_FILE"
           WORKDIR="$(mktemp -d)"
           unzip -q "$VSIX_FILE" -d "$WORKDIR"
 
-          # 兼容两种结构：extension/package.json 或根目录 package.json
           PKG_PATH=""
-          if [ -f "$WORKDIR/extension/package.json" ]; then
+          if [[ -f "$WORKDIR/extension/package.json" ]]; then
             PKG_PATH="$WORKDIR/extension/package.json"
-          elif [ -f "$WORKDIR/package.json" ]; then
+          elif [[ -f "$WORKDIR/package.json" ]]; then
             PKG_PATH="$WORKDIR/package.json"
           else
             echo "package.json not found inside VSIX"; exit 1
@@ -68,40 +85,47 @@ jobs:
           echo "Original engines.vscode:"
           jq -r '.engines.vscode // "N/A"' "$PKG_PATH"
 
-          # 修改为 >=1.81.0
           tmp="$(mktemp)"
           jq '.engines.vscode=">=1.81.0"' "$PKG_PATH" > "$tmp" && mv "$tmp" "$PKG_PATH"
 
           echo "Patched engines.vscode:"
           jq -r '.engines.vscode' "$PKG_PATH"
 
-          # 重新打包
-          OUT="gitlens-${{ steps.tag.outputs.tag }}-patched_1.81.vsix"
-          (cd "$WORKDIR" && zip -qr "../$OUT" .)
-          echo "OUT_VSIX=$OUT" >> $GITHUB_ENV
-          echo "Patched VSIX: $OUT"
+          OUT_NAME="gitlens-${{ steps.resolve.outputs.tag }}-patched_1.81.vsix"
+          OUT_PATH="$GITHUB_WORKSPACE/$OUT_NAME"
+          (cd "$WORKDIR" && zip -qr "$OUT_PATH" .)
+
+          echo "OUT_NAME=$OUT_NAME"   >> "$GITHUB_OUTPUT"
+          echo "OUT_PATH=$OUT_PATH"   >> "$GITHUB_OUTPUT"
+
+          echo "Result file:"
+          ls -lah "$OUT_PATH"
 
       - name: Create or update release in current repo
+        shell: bash
         run: |
-          set -e
-          TAG="${{ steps.tag.outputs.tag }}"
-          OUT="$OUT_VSIX"
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.tag }}"
+          OUT_PATH="${{ steps.patch.outputs.OUT_PATH }}"
+          OUT_NAME="${{ steps.patch.outputs.OUT_NAME }}"
 
-          # 如果 release 不存在就创建
+          echo "Uploading $OUT_PATH to release $TAG"
+          test -f "$OUT_PATH" || (echo "File not found: $OUT_PATH" && exit 1)
+
+          # 若 release 不存在则创建并附带资产
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" "$OUT" \
+            gh release create "$TAG" "$OUT_PATH" \
               --title "Patched GitLens $TAG (engines >= 1.81.0)" \
               --notes "Auto-patched from upstream $UPSTREAM_REPO@$TAG. engines.vscode set to >=1.81.0."
           else
-            # 存在就上传/覆盖资产
-            # 先尝试删除同名资产（若存在）
-            if gh release view "$TAG" --json assets -q '.assets[].name' | grep -Fx "$OUT" >/dev/null 2>&1; then
-              echo "Asset $OUT exists, replacing..."
-              gh release delete-asset "$TAG" "$OUT" -y || true
+            # 存在则先删同名资产（若存在），再上传
+            if gh release view "$TAG" --json assets -q '.assets[].name' | grep -Fx "$OUT_NAME" >/dev/null 2>&1; then
+              echo "Replacing existing asset $OUT_NAME ..."
+              gh release delete-asset "$TAG" "$OUT_NAME" -y || true
             fi
-            gh release upload "$TAG" "$OUT" --clobber
+            gh release upload "$TAG" "$OUT_PATH" --clobber
           fi
 
       - name: Summary
         run: |
-          echo "Patched and attached: $OUT_VSIX to release ${{ steps.tag.outputs.tag }}"
+          echo "Done. Attached ${{ steps.patch.outputs.OUT_NAME }} to release ${{ steps.resolve.outputs.tag }}"
