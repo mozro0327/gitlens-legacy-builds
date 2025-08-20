@@ -1,0 +1,107 @@
+name: Patch GitLens VSIX (engines >= 1.81.0)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag (e.g. v17.3.4). Leave empty to use latest"
+        required: false
+        default: ""
+  schedule:
+    - cron: "15 1 * * *" # 每天 10:15 JST 触发（01:15 UTC）
+
+permissions:
+  contents: write  # 需要创建/更新 release、上传资产
+
+env:
+  UPSTREAM_REPO: "eamodio/vscode-gitlens"
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  patch-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (current repo)
+        uses: actions/checkout@v4
+
+      - name: Determine target tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG=$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName)
+          fi
+          if [ -z "$TAG" ]; then
+            echo "Failed to resolve tag"; exit 1
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Target upstream tag: $TAG"
+
+      - name: Download upstream VSIX asset
+        run: |
+          mkdir -p vsix_src
+          gh release download "${{ steps.tag.outputs.tag }}" -R "$UPSTREAM_REPO" -p "*.vsix" -D vsix_src
+          echo "Downloaded files:"; ls -l vsix_src
+          VSIX_FILE=$(ls -1 vsix_src/*.vsix | head -n1)
+          if [ -z "$VSIX_FILE" ]; then
+            echo "No VSIX asset found in upstream release"; exit 1
+          fi
+          echo "VSIX_FILE=$VSIX_FILE" >> $GITHUB_ENV
+
+      - name: Patch engines.vscode to >=1.81.0
+        run: |
+          set -e
+          WORKDIR="$(mktemp -d)"
+          unzip -q "$VSIX_FILE" -d "$WORKDIR"
+
+          # 兼容两种结构：extension/package.json 或根目录 package.json
+          PKG_PATH=""
+          if [ -f "$WORKDIR/extension/package.json" ]; then
+            PKG_PATH="$WORKDIR/extension/package.json"
+          elif [ -f "$WORKDIR/package.json" ]; then
+            PKG_PATH="$WORKDIR/package.json"
+          else
+            echo "package.json not found inside VSIX"; exit 1
+          fi
+
+          echo "Original engines.vscode:"
+          jq -r '.engines.vscode // "N/A"' "$PKG_PATH"
+
+          # 修改为 >=1.81.0
+          tmp="$(mktemp)"
+          jq '.engines.vscode=">=1.81.0"' "$PKG_PATH" > "$tmp" && mv "$tmp" "$PKG_PATH"
+
+          echo "Patched engines.vscode:"
+          jq -r '.engines.vscode' "$PKG_PATH"
+
+          # 重新打包
+          OUT="gitlens-${{ steps.tag.outputs.tag }}-patched_1.81.vsix"
+          (cd "$WORKDIR" && zip -qr "../$OUT" .)
+          echo "OUT_VSIX=$OUT" >> $GITHUB_ENV
+          echo "Patched VSIX: $OUT"
+
+      - name: Create or update release in current repo
+        run: |
+          set -e
+          TAG="${{ steps.tag.outputs.tag }}"
+          OUT="$OUT_VSIX"
+
+          # 如果 release 不存在就创建
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" "$OUT" \
+              --title "Patched GitLens $TAG (engines >= 1.81.0)" \
+              --notes "Auto-patched from upstream $UPSTREAM_REPO@$TAG. engines.vscode set to >=1.81.0."
+          else
+            # 存在就上传/覆盖资产
+            # 先尝试删除同名资产（若存在）
+            if gh release view "$TAG" --json assets -q '.assets[].name' | grep -Fx "$OUT" >/dev/null 2>&1; then
+              echo "Asset $OUT exists, replacing..."
+              gh release delete-asset "$TAG" "$OUT" -y || true
+            fi
+            gh release upload "$TAG" "$OUT" --clobber
+          fi
+
+      - name: Summary
+        run: |
+          echo "Patched and attached: $OUT_VSIX to release ${{ steps.tag.outputs.tag }}"
